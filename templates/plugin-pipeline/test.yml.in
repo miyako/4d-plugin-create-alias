@@ -1,0 +1,183 @@
+name: Build and Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    env:
+      NATIVE_TESTS: '@@NATIVE_TESTS@@'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+          - os: windows-latest
+    runs-on: ${{ matrix.os }}
+@@IF:VCPKG@@
+    # A cold static vcpkg build can take hours; the binary cache makes reruns fast.
+    timeout-minutes: 360
+@@ENDIF:VCPKG@@
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - name: Verify pipeline ownership
+        run: python3 scripts/check_pipeline.py
+@@IF:VCPKG@@
+      - name: Resolve pinned vcpkg baseline (Windows)
+        id: vcpkg
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $baseline = python3 scripts/package.py vcpkg-baseline
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $temp = $env:RUNNER_TEMP -replace '\\', '/'
+          "baseline=$baseline" >> $env:GITHUB_OUTPUT
+          "root=$temp/vcpkg" >> $env:GITHUB_OUTPUT
+          "cache=$temp/vcpkg-binary-cache" >> $env:GITHUB_OUTPUT
+      - name: Restore vcpkg binary cache (Windows)
+        id: vcpkg-cache
+        if: runner.os == 'Windows'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.vcpkg.outputs.cache }}
+          key: vcpkg-x64-windows-static-release-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json', 'vcpkg-triplets/**') }}
+          restore-keys: |
+            vcpkg-x64-windows-static-release-${{ steps.vcpkg.outputs.baseline }}-
+      - name: Install static dependencies (Windows)
+        id: vcpkg-install
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VCPKG_ROOT: ${{ steps.vcpkg.outputs.root }}
+          VCPKG_BASELINE: ${{ steps.vcpkg.outputs.baseline }}
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ steps.vcpkg.outputs.cache }}
+          VCPKG_DISABLE_METRICS: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          git clone --quiet https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $env:VCPKG_ROOT checkout --quiet --detach $env:VCPKG_BASELINE
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:VCPKG_ROOT/vcpkg.exe" install --triplet x64-windows-static-release --host-triplet x64-windows-release-host --overlay-triplets=vcpkg-triplets --x-manifest-root=. --x-install-root=@@BUILD_DIR@@/vcpkg_installed --clean-after-build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Save vcpkg binary cache (Windows)
+        # Binary cache entries are ABI-hash addressed; completed packages are safe to keep after a later failure.
+        if: always() && runner.os == 'Windows' && steps.vcpkg.outcome == 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.vcpkg.outputs.cache }}
+          key: vcpkg-x64-windows-static-release-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json', 'vcpkg-triplets/**') }}
+@@ENDIF:VCPKG@@
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: cmake -S @@SOURCE_DIR@@ -B @@BUILD_DIR@@ -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=@@MACOS_DEPLOYMENT_TARGET@@
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+@@IF:VCPKG@@
+        env:
+          VCPKG_ROOT: ${{ steps.vcpkg.outputs.root }}
+        run: |
+          $workspace = (Get-Location).Path -replace '\\', '/'
+          cmake -S @@SOURCE_DIR@@ -B @@BUILD_DIR@@ -A x64 "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static-release -DVCPKG_HOST_TRIPLET=x64-windows-release-host "-DVCPKG_OVERLAY_TRIPLETS=$workspace/vcpkg-triplets" "-DVCPKG_INSTALLED_DIR=$workspace/@@BUILD_DIR@@/vcpkg_installed" -DVCPKG_MANIFEST_MODE=OFF -DVCPKG_MANIFEST_INSTALL=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+@@ELSE:VCPKG@@
+        run: cmake -S @@SOURCE_DIR@@ -B @@BUILD_DIR@@ -A x64
+@@ENDIF:VCPKG@@
+      - name: Build
+        id: build
+        run: cmake --build @@BUILD_DIR@@ --config Release --parallel
+      - name: Native tests
+        if: env.NATIVE_TESTS == 'true'
+        run: ctest --test-dir @@BUILD_DIR@@ -C Release --output-on-failure
+      - name: Package provenance and release checks tests
+        shell: bash
+        env:
+          TMPDIR: ${{ github.workspace }}/@@BUILD_DIR@@
+        run: |
+          set -euo pipefail
+          for suite in test_package.py test_release_checks.py test_sign_package.py test_publish_release.py test_verify_release.py test_pipeline_contract.py; do
+            python3 -m unittest discover -s scripts/tests -p "$suite" -v
+          done
+      - name: 4D integration
+        uses: ./.github/actions/tool4d-test
+        with:
+          project: @@TEST_PROJECT@@
+          startup_method: @@STARTUP_METHOD@@
+      - name: Stage tested native input (macOS)
+        if: runner.os == 'macOS'
+        run: python3 scripts/package.py stage --platform macos --output .package-inputs
+      - name: Stage tested native input (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python3 scripts/package.py stage --platform windows --output .package-inputs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ runner.os == 'macOS' && 'macos' || 'windows' }}-${{ github.sha }}
+          path: .package-inputs/${{ runner.os == 'macOS' && 'macos' || 'windows' }}/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 2
+  package-layout:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - name: Verify pipeline ownership
+        run: python3 scripts/check_pipeline.py
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-macos-${{ github.sha }}
+          path: .package-inputs/macos
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-windows-${{ github.sha }}
+          path: .package-inputs/windows
+      - name: Validate same-run cross-platform assembly
+        run: |
+          set -euo pipefail
+          python3 scripts/package.py assemble --inputs .package-inputs --output .package-validation
+          # This ad-hoc seal is test-only; production requires Developer ID.
+          codesign --force --sign - ".package-validation/payload/@@PRODUCT@@.bundle"
+          codesign --verify --strict ".package-validation/payload/@@PRODUCT@@.bundle"
+          python3 scripts/package.py inventory --payload .package-validation/payload --output .package-validation/payload/PROVENANCE.json
+          python3 scripts/package.py verify --payload .package-validation/payload --manifest .package-validation/payload/PROVENANCE.json
+      - name: Exercise ZIP and DMG layout
+        run: |
+          set -euo pipefail
+          ditto -c -k --sequesterRsrc .package-validation/payload .package-validation/layout.zip
+          ditto -x -k .package-validation/layout.zip .package-validation/extracted
+          python3 scripts/package.py verify --payload .package-validation/extracted --manifest .package-validation/extracted/PROVENANCE.json
+          hdiutil create -format UDZO -volname @@PRODUCT@@ -srcfolder .package-validation/payload .package-validation/layout.dmg
+          mkdir .package-validation/mounted
+          hdiutil attach -nobrowse -readonly -mountpoint "$PWD/.package-validation/mounted" .package-validation/layout.dmg
+          trap 'hdiutil detach "$PWD/.package-validation/mounted"' EXIT
+          python3 scripts/package.py verify --payload .package-validation/mounted --manifest .package-validation/mounted/PROVENANCE.json
+          mkdir -p @@TEST_ROOT@@/Plugins
+          [ ! -e "@@TEST_ROOT@@/Plugins/@@PRODUCT@@.bundle" ]
+          [ ! -L "@@TEST_ROOT@@/Plugins/@@PRODUCT@@.bundle" ]
+          ditto .package-validation/extracted/@@PRODUCT@@.bundle @@TEST_ROOT@@/Plugins/@@PRODUCT@@.bundle
+      - name: Smoke test combined plugin from extracted ZIP
+        uses: ./.github/actions/tool4d-test
+        with:
+          project: @@TEST_PROJECT@@
+          startup_method: @@STARTUP_METHOD@@
