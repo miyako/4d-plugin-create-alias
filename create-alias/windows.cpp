@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <objbase.h>
+#include <propsys.h>
 
 #include <climits>
 #include <cwctype>
@@ -12,6 +13,17 @@
 
 namespace alias_plugin {
 namespace {
+
+// PKEY_Link_Arguments (System.Link.Arguments), defined locally to avoid any
+// property-system helper imports or external property-key definitions.
+constexpr PROPERTYKEY linkArgumentsKey = {
+    {0x436f2667, 0x14e2, 0x4feb, {0xb3, 0x0a, 0x14, 0x6c, 0x53, 0xb5, 0xb6, 0x74}}, 100
+};
+
+struct PropertyValue {
+    PROPVARIANT value{};
+    ~PropertyValue() { PropVariantClear(&value); }
+};
 
 template<class T> struct ComPtr {
     T* value = nullptr;
@@ -109,13 +121,26 @@ bool verifyPersistedArguments(Result& result, const std::wstring& staged,
                  reinterpret_cast<void**>(&savedFile.value)), "Cannot obtain persisted shortcut verifier.") ||
         !checked(result, savedFile->Load(staged.c_str(), STGM_READ),
                  "Cannot reload staged shortcut.")) return false;
-    // Reload a new COM object: the original object can retain the entire input
-    // even when Shell Link persistence subsequently truncates it.
-    std::vector<wchar_t> readback(32767);
-    const HRESULT status = savedLink->GetArguments(readback.data(), static_cast<int>(readback.size()));
-    if (!checked(result, status, "Cannot read persisted shortcut arguments.", option)) return false;
-    if (expected == readback.data()) return true;
-    error(result, "IO_ERROR", "Persisted Shell Link changed or truncated the arguments.",
+    ComPtr<IPropertyStore> properties;
+    PropertyValue arguments;
+    if (!checked(result, savedLink->QueryInterface(IID_IPropertyStore,
+                 reinterpret_cast<void**>(&properties.value)), "Cannot obtain persisted shortcut properties.", option) ||
+        !checked(result, properties->GetValue(linkArgumentsKey, &arguments.value),
+                 "Cannot read persisted shortcut arguments property.", option)) return false;
+    const bool validType = arguments.value.vt == VT_LPWSTR || arguments.value.vt == VT_EMPTY;
+    const std::wstring actual = arguments.value.vt == VT_LPWSTR && arguments.value.pwszVal ?
+                                arguments.value.pwszVal : L"";
+    if (validType && expected == actual) return true;
+    // Microsoft recommends IPropertyStore for full arguments. GetArguments is
+    // diagnostic only: a short legacy read must not reject an intact property.
+    std::vector<wchar_t> legacy(32767);
+    const HRESULT legacyStatus = savedLink->GetArguments(legacy.data(), static_cast<int>(legacy.size()));
+    const std::string message = "Persisted Shell Link arguments mismatch: expected UTF-16 length=" +
+        std::to_string(expected.size()) + ", property length=" + std::to_string(actual.size()) +
+        ", property type=" + std::to_string(arguments.value.vt) +
+        ", GetArguments length=" + std::to_string(std::wstring(legacy.data()).size()) +
+        ", GetArguments HRESULT=" + std::to_string(static_cast<std::int64_t>(legacyStatus)) + ".";
+    error(result, "IO_ERROR", message.c_str(),
           option, static_cast<std::int64_t>(E_FAIL), "HRESULT");
     return false;
 }
@@ -165,8 +190,8 @@ Result createAlias(const std::string& target, const std::string& destination,
     if (!wide(result, options.arguments ? quoteArguments(*options.arguments) :
               options.argumentsText.value_or(""), argumentsW,
               options.arguments ? "arguments" : "argumentsText") ||
-        // Use the conservative Shell Link field bound, not CreateProcess's much
-        // larger command-line bound. Persistence must still be verified below.
+        // Supported bound, independently verified after persistence through
+        // IPropertyStore rather than the legacy GetArguments accessor.
         !bounded(result, argumentsW, INFOTIPSIZE-1, options.arguments ? "arguments" : "argumentsText"))
         return result;
     const auto pathOption = [&](const std::optional<std::string>& value,

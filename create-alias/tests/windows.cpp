@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <propsys.h>
 
 #include <cstdint>
 #include <atomic>
@@ -24,10 +25,21 @@ using alias_plugin::Options;
 using alias_plugin::Result;
 
 namespace {
+constexpr PROPERTYKEY linkArgumentsKey = {
+    {0x436f2667, 0x14e2, 0x4feb, {0xb3, 0x0a, 0x14, 0x6c, 0x53, 0xb5, 0xb6, 0x74}}, 100
+};
+struct PropertyValue {
+    PROPVARIANT value{};
+    ~PropertyValue() { PropVariantClear(&value); }
+};
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
-void hr(HRESULT value, const char* message) { require(SUCCEEDED(value), message); }
+void hr(HRESULT value, const char* message) {
+    if (FAILED(value))
+        throw std::runtime_error(std::string(message) + " HRESULT=" +
+                                 std::to_string(static_cast<std::int64_t>(value)));
+}
 std::string utf8(const std::wstring& text) {
     if (text.empty()) return {};
     const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
@@ -43,7 +55,8 @@ void success(const Result& result) {
     if (!result.ok) {
         std::string message = "createAlias failed:";
         for (const auto& error : result.errors)
-            message += " " + error.code + "/" + error.option + " " + error.message;
+            message += " " + error.code + "/" + error.option + " " + error.message +
+                       " [" + error.nativeDomain + ":" + std::to_string(error.nativeCode) + "]";
         throw std::runtime_error(message);
     }
     require(result.errors.empty(), "Successful result contains errors");
@@ -80,6 +93,37 @@ struct Link {
     }
     ~Link() { if (persist) persist->Release(); if (link) link->Release(); }
 };
+
+std::string storedArguments(Link& saved) {
+    IPropertyStore* properties = nullptr;
+    hr(saved.link->QueryInterface(IID_IPropertyStore, reinterpret_cast<void**>(&properties)),
+       "Cannot query shortcut property store");
+    PropertyValue value;
+    const HRESULT status = properties->GetValue(linkArgumentsKey, &value.value);
+    properties->Release();
+    hr(status, "Cannot read PKEY_Link_Arguments");
+    require(value.value.vt == VT_LPWSTR || value.value.vt == VT_EMPTY,
+            "PKEY_Link_Arguments has unexpected property type");
+    const std::wstring actual = value.value.vt == VT_LPWSTR && value.value.pwszVal ?
+                                value.value.pwszVal : L"";
+    std::vector<wchar_t> legacy(32767);
+    const HRESULT legacyStatus = saved.link->GetArguments(legacy.data(), static_cast<int>(legacy.size()));
+    const std::wstring legacyText(legacy.data());
+    std::cout << "ARGUMENT READBACK property UTF-16=" << actual.size()
+              << ", GetArguments UTF-16=" << legacyText.size()
+              << ", GetArguments HRESULT=" << static_cast<std::int64_t>(legacyStatus)
+              << ", equal=" << (actual == legacyText) << '\n' << std::flush;
+    return utf8(actual);
+}
+
+void exactArguments(Link& saved, const std::string& expected, const char* message) {
+    std::cout << "ARGUMENT EXPECTED UTF-8 bytes=" << expected.size() << '\n' << std::flush;
+    const auto actual = storedArguments(saved);
+    if (actual != expected)
+        throw std::runtime_error(std::string(message) + ": expected UTF-8 bytes=" +
+                                 std::to_string(expected.size()) + ", actual UTF-8 bytes=" +
+                                 std::to_string(actual.size()));
+}
 struct Root {
     fs::path value;
     Root() {
@@ -120,6 +164,8 @@ std::vector<std::wstring> recorded(const fs::path& output) {
 
 void launch(const fs::path& shortcut, const fs::path& output,
             const std::vector<std::wstring>& expected) {
+    std::cout << "LAUNCH " << path(shortcut.filename()) << " argc=" << expected.size()
+              << '\n' << std::flush;
     require(SetEnvironmentVariableW(L"CREATE_ALIAS_ARGV_OUTPUT", output.c_str()) != FALSE,
             "Cannot set recorder environment");
     SHELLEXECUTEINFOW execution{};
@@ -161,8 +207,7 @@ void readback(const fs::path& root, const fs::path& recorder) {
     wchar_t buffer[32767]{};
     hr(saved.link->GetPath(buffer, 32767, nullptr, SLGP_RAWPATH), "Cannot read target");
     require(fs::path(buffer) == recorder, "Target readback mismatch");
-    hr(saved.link->GetArguments(buffer, 32767), "Cannot read arguments");
-    require(utf8(buffer) == alias_plugin::quoteArguments(*options.arguments), "Argument readback mismatch");
+    exactArguments(saved, alias_plugin::quoteArguments(*options.arguments), "Argument property readback mismatch");
     hr(saved.link->GetWorkingDirectory(buffer, 32767), "Cannot read working directory");
     require(fs::path(buffer) == working, "Working directory readback mismatch");
     hr(saved.link->GetDescription(buffer, 32767), "Cannot read description");
@@ -188,8 +233,7 @@ void readback(const fs::path& root, const fs::path& recorder) {
     empty.iconIndex = 0;
     success(alias_plugin::createAlias(path(recorder), path(root / L"empty-options"), empty));
     Link emptyLink(root / L"empty-options.lnk");
-    hr(emptyLink.link->GetArguments(buffer, 32767), "Cannot read empty arguments");
-    require(buffer[0] == L'\0', "Explicit empty array not retained");
+    exactArguments(emptyLink, "", "Explicit empty array not retained");
     hr(emptyLink.link->GetDescription(buffer, 32767), "Cannot read empty description");
     require(buffer[0] == L'\0', "Explicit empty description not retained");
     Options folderOptions;
@@ -201,10 +245,10 @@ void readback(const fs::path& root, const fs::path& recorder) {
     Options boundary;
     boundary.description = std::string(1023, 'd');
     boundary.argumentsText = std::string(1023, 'a');
+    std::cout << "STAGE readback supported boundary: arguments=1023, description=1023\n" << std::flush;
     success(alias_plugin::createAlias(path(recorder), path(root / L"field-boundaries"), boundary));
     Link boundaryLink(root / L"field-boundaries.lnk");
-    hr(boundaryLink.link->GetArguments(buffer, 32767), "Cannot read maximum arguments");
-    require(utf8(buffer) == *boundary.argumentsText, "Maximum argument field was truncated");
+    exactArguments(boundaryLink, *boundary.argumentsText, "Maximum argument property field was truncated");
     hr(boundaryLink.link->GetDescription(buffer, 32767), "Cannot read maximum description");
     require(utf8(buffer) == *boundary.description, "Maximum description was truncated");
 }
@@ -224,9 +268,7 @@ void launchArguments(const fs::path& root, const fs::path& recorder) {
     raw.argumentsText = "\"verbatim spaced\" \"\" plain \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e";
     success(alias_plugin::createAlias(path(recorder), path(root / L"raw"), raw));
     Link rawLink(root / L"raw.lnk");
-    wchar_t buffer[32767]{};
-    hr(rawLink.link->GetArguments(buffer, 32767), "Cannot read raw arguments");
-    require(utf8(buffer) == *raw.argumentsText, "Raw arguments were transformed");
+    exactArguments(rawLink, *raw.argumentsText, "Raw arguments were transformed");
     launch(root / L"raw.lnk", root / L"raw.bin", {L"verbatim spaced", L"", L"plain", L"\u65e5\u672c\u8a9e"});
     Options none;
     success(alias_plugin::createAlias(path(recorder), path(root / L"none"), none));
@@ -462,10 +504,15 @@ int wmain(int argc, wchar_t** argv) {
         const fs::path source = fs::absolute(argv[1]);
         const fs::path recorder = root.value / L"recorder space \u65e5\u672c\u8a9e.exe";
         fs::copy_file(source, recorder);
+        std::cout << "STAGE property readback\n" << std::flush;
         readback(root.value, recorder);
+        std::cout << "STAGE real shortcut argv launches and supported boundaries\n" << std::flush;
         launchArguments(root.value, recorder);
+        std::cout << "STAGE validation and overwrite preservation\n" << std::flush;
         failures(root.value, recorder);
+        std::cout << "STAGE concurrent no-clobber publication\n" << std::flush;
         concurrentCreation(root.value, recorder);
+        std::cout << "STAGE COM apartment balance\n" << std::flush;
         apartmentTests(root.value, recorder);
         std::cout << "PASS Windows native shortcut tests\n";
         return 0;
