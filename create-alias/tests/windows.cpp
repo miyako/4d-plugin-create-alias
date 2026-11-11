@@ -28,6 +28,9 @@ namespace {
 constexpr PROPERTYKEY linkArgumentsKey = {
     {0x436f2667, 0x14e2, 0x4feb, {0xb3, 0x0a, 0x14, 0x6c, 0x53, 0xb5, 0xb6, 0x74}}, 100
 };
+constexpr PROPERTYKEY commentKey = {
+    {0xf29f85e0, 0x4ff9, 0x1068, {0xab, 0x91, 0x08, 0x00, 0x2b, 0x27, 0xb3, 0xd9}}, 6
+};
 struct PropertyValue {
     PROPVARIANT value{};
     ~PropertyValue() { PropVariantClear(&value); }
@@ -92,18 +95,21 @@ struct Link {
     ~Link() { if (persist) persist->Release(); if (link) link->Release(); }
 };
 
-std::string storedArguments(Link& saved) {
+std::wstring storedProperty(Link& saved, REFPROPERTYKEY key) {
     IPropertyStore* properties = nullptr;
     hr(saved.link->QueryInterface(IID_IPropertyStore, reinterpret_cast<void**>(&properties)),
        "Cannot query shortcut property store");
     PropertyValue value;
-    const HRESULT status = properties->GetValue(linkArgumentsKey, &value.value);
+    const HRESULT status = properties->GetValue(key, &value.value);
     properties->Release();
-    hr(status, "Cannot read PKEY_Link_Arguments");
+    hr(status, "Cannot read shortcut text property");
     require(value.value.vt == VT_LPWSTR || value.value.vt == VT_EMPTY,
-            "PKEY_Link_Arguments has unexpected property type");
-    const std::wstring actual = value.value.vt == VT_LPWSTR && value.value.pwszVal ?
-                                value.value.pwszVal : L"";
+            "Shortcut text property has unexpected property type");
+    return value.value.vt == VT_LPWSTR && value.value.pwszVal ? value.value.pwszVal : L"";
+}
+
+std::string storedArguments(Link& saved) {
+    const auto actual = storedProperty(saved, linkArgumentsKey);
     std::vector<wchar_t> legacy(32767);
     const HRESULT legacyStatus = saved.link->GetArguments(legacy.data(), static_cast<int>(legacy.size()));
     const std::wstring legacyText(legacy.data());
@@ -112,6 +118,21 @@ std::string storedArguments(Link& saved) {
               << ", GetArguments HRESULT=" << static_cast<std::int64_t>(legacyStatus)
               << ", equal=" << (actual == legacyText) << '\n' << std::flush;
     return utf8(actual);
+}
+
+void exactDescription(Link& saved, const std::string& expected, const char* message) {
+    const auto actual = storedProperty(saved, commentKey);
+    std::vector<wchar_t> legacy(32767);
+    const auto status = saved.link->GetDescription(legacy.data(), static_cast<int>(legacy.size()));
+    std::cout << "DESCRIPTION expected UTF-8 bytes=" << expected.size()
+              << ", property UTF-16=" << actual.size()
+              << ", GetDescription UTF-16=" << std::wstring(legacy.data()).size()
+              << ", HRESULT=" << static_cast<std::int64_t>(status) << '\n' << std::flush;
+    const auto encoded = utf8(actual);
+    if (encoded != expected)
+        throw std::runtime_error(std::string(message) + ": expected UTF-8 bytes=" +
+                                 std::to_string(expected.size()) + ", actual UTF-8 bytes=" +
+                                 std::to_string(encoded.size()));
 }
 
 void exactArguments(Link& saved, const std::string& expected, const char* message) {
@@ -173,13 +194,18 @@ void diagnoseLegacyPersistence(const fs::path& root, const fs::path& recorder) {
     hr(probe.link->SetDescription(description.c_str()), "Cannot set diagnostic description");
     std::cout << "PROBE raw SetArguments after SetDescription\n" << std::flush;
     const auto afterDescription = storedArguments(probe);
+    const auto descriptionImmediate = storedProperty(probe, commentKey);
     hr(probe.persist->Save(probePath.c_str(), TRUE), "Cannot save diagnostic shortcut");
     Link reloaded(probePath);
     std::cout << "PROBE raw SetArguments fresh reload\n" << std::flush;
     const auto persisted = storedArguments(reloaded);
+    const auto descriptionPersisted = storedProperty(reloaded, commentKey);
     std::cout << "PROBE UTF-8 ASCII lengths immediate=" << immediate.size()
               << ", after-description=" << afterDescription.size()
-              << ", persisted=" << persisted.size() << '\n' << std::flush;
+              << ", persisted=" << persisted.size()
+              << ", description immediate UTF-16=" << descriptionImmediate.size()
+              << ", description persisted UTF-16=" << descriptionPersisted.size()
+              << '\n' << std::flush;
 }
 
 void launch(const fs::path& shortcut, const fs::path& output,
@@ -232,6 +258,7 @@ void readback(const fs::path& root, const fs::path& recorder) {
     require(fs::path(buffer) == working, "Working directory readback mismatch");
     hr(saved.link->GetDescription(buffer, 32767), "Cannot read description");
     require(utf8(buffer) == *options.description, "Description readback mismatch");
+    exactDescription(saved, *options.description, "Description property readback mismatch");
     int number = 0;
     hr(saved.link->GetIconLocation(buffer, 32767, &number), "Cannot read icon");
     require(fs::path(buffer) == recorder && number == -7, "Icon readback mismatch");
@@ -256,6 +283,7 @@ void readback(const fs::path& root, const fs::path& recorder) {
     exactArguments(emptyLink, "", "Explicit empty array not retained");
     hr(emptyLink.link->GetDescription(buffer, 32767), "Cannot read empty description");
     require(buffer[0] == L'\0', "Explicit empty description not retained");
+    exactDescription(emptyLink, "", "Explicit empty description property not retained");
     Options folderOptions;
     const auto folderResult = alias_plugin::createAlias(path(working), path(root / L"folder"), folderOptions);
     success(folderResult);
@@ -265,7 +293,6 @@ void readback(const fs::path& root, const fs::path& recorder) {
 }
 
 void boundaryReadback(const fs::path& root, const fs::path& recorder) {
-    wchar_t buffer[32767]{};
     std::cout << "STAGE independent argument-only boundary fixture\n" << std::flush;
     Options argumentOnly;
     argumentOnly.argumentsText = std::string(1023, 'a');
@@ -277,8 +304,7 @@ void boundaryReadback(const fs::path& root, const fs::path& recorder) {
     descriptionOnly.description = std::string(1023, 'd');
     success(alias_plugin::createAlias(path(recorder), path(root / L"description-only-boundary"), descriptionOnly));
     Link descriptionOnlyLink(root / L"description-only-boundary.lnk");
-    hr(descriptionOnlyLink.link->GetDescription(buffer, 32767), "Cannot read description-only boundary");
-    require(utf8(buffer) == *descriptionOnly.description, "Description-only boundary mismatch");
+    exactDescription(descriptionOnlyLink, *descriptionOnly.description, "Description-only boundary mismatch");
     Options boundary;
     boundary.description = std::string(1023, 'd');
     boundary.argumentsText = std::string(1023, 'a');
@@ -286,8 +312,7 @@ void boundaryReadback(const fs::path& root, const fs::path& recorder) {
     success(alias_plugin::createAlias(path(recorder), path(root / L"field-boundaries"), boundary));
     Link boundaryLink(root / L"field-boundaries.lnk");
     exactArguments(boundaryLink, *boundary.argumentsText, "Maximum argument property field was truncated");
-    hr(boundaryLink.link->GetDescription(buffer, 32767), "Cannot read maximum description");
-    require(utf8(buffer) == *boundary.description, "Maximum description was truncated");
+    exactDescription(boundaryLink, *boundary.description, "Maximum description was truncated");
 }
 
 void launchArguments(const fs::path& root, const fs::path& recorder) {
@@ -428,6 +453,10 @@ void failures(const fs::path& root, const fs::path& recorder) {
     excessive.arguments = std::vector<std::string>{std::string(1022, 'x')};
     failure(alias_plugin::createAlias(path(recorder), path(existing), excessive), "INVALID_OPTION");
     require(bytes(existing) == originalLink, "Overlong serialized arguments changed the existing shortcut");
+    excessive.arguments.reset();
+    excessive.description = std::string(1024, 'x');
+    failure(alias_plugin::createAlias(path(recorder), path(existing), excessive), "INVALID_OPTION");
+    require(bytes(existing) == originalLink, "Overlong description changed the existing shortcut");
     options.description = "replacement";
     require(SetFileAttributesW(existing.c_str(), FILE_ATTRIBUTE_READONLY) != FALSE,
             "Cannot make shortcut read-only");

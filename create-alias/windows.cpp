@@ -19,6 +19,9 @@ namespace {
 constexpr PROPERTYKEY linkArgumentsKey = {
     {0x436f2667, 0x14e2, 0x4feb, {0xb3, 0x0a, 0x14, 0x6c, 0x53, 0xb5, 0xb6, 0x74}}, 100
 };
+constexpr PROPERTYKEY commentKey = {
+    {0xf29f85e0, 0x4ff9, 0x1068, {0xab, 0x91, 0x08, 0x00, 0x2b, 0x27, 0xb3, 0xd9}}, 6
+};
 
 struct PropertyValue {
     PROPVARIANT value{};
@@ -110,8 +113,24 @@ bool sameFile(const BY_HANDLE_FILE_INFORMATION& a, const BY_HANDLE_FILE_INFORMAT
            a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow;
 }
 
-bool setArgumentsProperty(Result& result, IShellLinkW* link, const std::wstring& expected,
-                          const char* option) {
+bool verifyTextProperty(Result& result, IPropertyStore* properties, REFPROPERTYKEY key,
+                        const std::wstring& expected, const char* option, const char* stage) {
+    PropertyValue actual;
+    if (!checked(result, properties->GetValue(key, &actual.value),
+                 "Cannot verify shortcut text property.", option)) return false;
+    const std::wstring text = actual.value.vt == VT_LPWSTR && actual.value.pwszVal ?
+                              actual.value.pwszVal : L"";
+    if ((actual.value.vt == VT_LPWSTR || actual.value.vt == VT_EMPTY) && text == expected) return true;
+    const std::string message = std::string(stage) + " " + option +
+        " mismatch: expected UTF-16 length=" + std::to_string(expected.size()) +
+        ", property length=" + std::to_string(text.size()) +
+        ", property type=" + std::to_string(actual.value.vt) + ".";
+    error(result, "IO_ERROR", message.c_str(), option, static_cast<std::int64_t>(E_FAIL), "HRESULT");
+    return false;
+}
+
+bool setTextProperties(Result& result, IShellLinkW* link, const std::wstring& expected,
+                       const char* option, const std::wstring* description) {
     ComPtr<IPropertyStore> properties;
     if (!checked(result, link->QueryInterface(IID_IPropertyStore,
                  reinterpret_cast<void**>(&properties.value)), "Cannot obtain writable shortcut properties.", option))
@@ -121,22 +140,34 @@ bool setArgumentsProperty(Result& result, IShellLinkW* link, const std::wstring&
     input.vt = VT_LPWSTR;
     input.pwszVal = const_cast<wchar_t*>(expected.c_str());
     if (!checked(result, properties->SetValue(linkArgumentsKey, input),
-                 "Cannot set complete shortcut arguments property.", option) ||
-        !checked(result, properties->Commit(), "Cannot commit shortcut arguments property.", option)) return false;
-    PropertyValue actual;
-    if (!checked(result, properties->GetValue(linkArgumentsKey, &actual.value),
-                 "Cannot verify arguments before saving.", option)) return false;
-    const std::wstring text = actual.value.vt == VT_LPWSTR && actual.value.pwszVal ?
-                              actual.value.pwszVal : L"";
-    if ((actual.value.vt == VT_LPWSTR || actual.value.vt == VT_EMPTY) && text == expected) return true;
-    const std::string message = "Arguments changed before Save: expected UTF-16 length=" +
-        std::to_string(expected.size()) + ", immediate property length=" + std::to_string(text.size()) +
-        ", property type=" + std::to_string(actual.value.vt) + ".";
-    error(result, "IO_ERROR", message.c_str(), option, static_cast<std::int64_t>(E_FAIL), "HRESULT");
-    return false;
+                 "Cannot set complete shortcut arguments property.", option)) return false;
+    if (description) {
+        input.pwszVal = const_cast<wchar_t*>(description->c_str());
+        if (!checked(result, properties->SetValue(commentKey, input),
+                     "Cannot set complete shortcut description property.", "description")) return false;
+    }
+    if (!checked(result, properties->Commit(), "Cannot commit shortcut text properties.", option)) return false;
+    return verifyTextProperty(result, properties.value, linkArgumentsKey, expected, option, "Before Save") &&
+           (!description || verifyTextProperty(result, properties.value, commentKey, *description,
+                                                "description", "Before Save"));
 }
 
-std::string binaryArgumentsDiagnostic(const std::wstring& staged) {
+bool samePath(const std::wstring& first, const std::wstring& second) {
+    if (first.empty() || second.empty()) return false;
+    const auto normalized = [](const std::wstring& path) {
+        std::vector<wchar_t> buffer(32767);
+        const DWORD length = GetFullPathNameW(path.c_str(), static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
+        if (!length || length >= buffer.size()) return std::wstring{};
+        std::wstring result(buffer.data(), length);
+        while (result.size() > 3 && result.back() == L'\\') result.pop_back();
+        return result;
+    };
+    const auto a = normalized(first), b = normalized(second);
+    return !a.empty() && !b.empty() &&
+           CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
+std::string binaryArgumentsDiagnostic(const std::wstring& staged, std::uint32_t wanted = 32) {
     Handle file;
     file.value = CreateFileW(staged.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -171,16 +202,19 @@ std::string binaryArgumentsDiagnostic(const std::wstring& staged) {
         offset += 2;
         const std::size_t bytes = std::size_t(count) * ((flags & 128) ? 2 : 1);
         if (offset > data.size() || bytes > data.size() - offset) return ", StringData truncated field";
-        if (field == 32)
-            return ", binary StringData argument characters=" + std::to_string(count) +
+        if (field == wanted)
+            return std::string(", binary StringData ") + (wanted == 4 ? "description" : "argument") +
+                   " characters=" + std::to_string(count) +
                    ", Unicode=" + std::to_string((flags & 128) != 0);
         offset += bytes;
     }
-    return ", binary StringData arguments absent";
+    return ", binary StringData requested field absent";
 }
 
-bool verifyPersistedArguments(Result& result, const std::wstring& staged,
-                              const std::wstring& expected, const char* option) {
+bool verifyPersistedFields(Result& result, const std::wstring& staged,
+                           const std::wstring& expected, const char* option, const Options& options,
+                           const std::wstring& target, const std::wstring& description,
+                           const std::wstring& working, const std::wstring& icon) {
     ComPtr<IShellLinkW> savedLink;
     ComPtr<IPersistFile> savedFile;
     if (!checked(result, CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
@@ -199,7 +233,46 @@ bool verifyPersistedArguments(Result& result, const std::wstring& staged,
     const bool validType = arguments.value.vt == VT_LPWSTR || arguments.value.vt == VT_EMPTY;
     const std::wstring actual = arguments.value.vt == VT_LPWSTR && arguments.value.pwszVal ?
                                 arguments.value.pwszVal : L"";
-    if (validType && expected == actual) return true;
+    if (validType && expected == actual) {
+        if (options.description && !verifyTextProperty(result, properties.value, commentKey, description,
+                                                       "description", "Persisted")) {
+            result.errors.back().message += binaryArgumentsDiagnostic(staged, 4);
+            return false;
+        }
+        std::vector<wchar_t> buffer(32767);
+        const auto pathMatches = [&](const std::wstring& value, const char* field) {
+            if (samePath(value, buffer.data())) return true;
+            const std::string message = std::string("Persisted ") + field +
+                " path mismatch: expected UTF-16 length=" + std::to_string(value.size()) +
+                ", actual length=" + std::to_string(std::wstring(buffer.data()).size()) + ".";
+            error(result, "IO_ERROR", message.c_str(), field, static_cast<std::int64_t>(E_FAIL), "HRESULT");
+            return false;
+        };
+        if (!checked(result, savedLink->GetPath(buffer.data(), static_cast<int>(buffer.size()), nullptr, SLGP_RAWPATH),
+                     "Cannot verify persisted target.", "targetPath") || !pathMatches(target, "targetPath")) return false;
+        if (options.workingDirectory &&
+            (!checked(result, savedLink->GetWorkingDirectory(buffer.data(), static_cast<int>(buffer.size())),
+                      "Cannot verify persisted working directory.", "workingDirectory") ||
+             !pathMatches(working, "workingDirectory"))) return false;
+        int number = 0;
+        if (options.iconPath) {
+            if (!checked(result, savedLink->GetIconLocation(buffer.data(), static_cast<int>(buffer.size()), &number),
+                         "Cannot verify persisted icon.", "iconPath") || !pathMatches(icon, "iconPath")) return false;
+            if (number != options.iconIndex.value_or(0)) {
+                error(result, "IO_ERROR", "Persisted iconIndex differs from supplied value.", "iconIndex");
+                return false;
+            }
+        }
+        if (options.showCommand) {
+            if (!checked(result, savedLink->GetShowCmd(&number), "Cannot verify persisted show command.",
+                         "showCommand")) return false;
+            if (number != *options.showCommand) {
+                error(result, "IO_ERROR", "Persisted showCommand differs from supplied value.", "showCommand");
+                return false;
+            }
+        }
+        return true;
+    }
     // Microsoft recommends IPropertyStore for full arguments. GetArguments is
     // diagnostic only: a short legacy read must not reject an intact property.
     std::vector<wchar_t> legacy(32767);
@@ -362,8 +435,8 @@ Result createAlias(const std::string& target, const std::string& destination,
         (options.showCommand && !checked(result, link->SetShowCmd(*options.showCommand),
                                         "Cannot set show command.", "showCommand"))) return result;
     // Commit the authoritative property after every other field has been set.
-    if (!setArgumentsProperty(result, link.value, argumentsW,
-                              options.arguments ? "arguments" : "argumentsText")) return result;
+    if (!setTextProperties(result, link.value, argumentsW, options.arguments ? "arguments" : "argumentsText",
+                           options.description ? &descriptionW : nullptr)) return result;
     const auto parent = destinationW.substr(0, destinationW.find_last_of(L'\\') + 1);
     std::wstring staging;
     std::string stagingPath;
@@ -388,8 +461,8 @@ Result createAlias(const std::string& target, const std::string& destination,
     bool published = false;
     bool keepBackup = false;
     if (checked(result, persist->Save(staged.c_str(), TRUE), "Cannot save staged shortcut.")) {
-        const bool persisted = verifyPersistedArguments(result, staged, argumentsW,
-                                                        options.arguments ? "arguments" : "argumentsText");
+        const bool persisted = verifyPersistedFields(result, staged, argumentsW,
+            options.arguments ? "arguments" : "argumentsText", options, targetW, descriptionW, workingW, iconW);
         if (persisted && existing.value != INVALID_HANDLE_VALUE) {
             Handle current;
             current.value = CreateFileW(destinationW.c_str(), GENERIC_READ,
