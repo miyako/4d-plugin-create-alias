@@ -110,6 +110,75 @@ bool sameFile(const BY_HANDLE_FILE_INFORMATION& a, const BY_HANDLE_FILE_INFORMAT
            a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow;
 }
 
+bool setArgumentsProperty(Result& result, IShellLinkW* link, const std::wstring& expected,
+                          const char* option) {
+    ComPtr<IPropertyStore> properties;
+    if (!checked(result, link->QueryInterface(IID_IPropertyStore,
+                 reinterpret_cast<void**>(&properties.value)), "Cannot obtain writable shortcut properties.", option))
+        return false;
+    // SetValue copies the borrowed input string; do not PropVariantClear it.
+    PROPVARIANT input{};
+    input.vt = VT_LPWSTR;
+    input.pwszVal = const_cast<wchar_t*>(expected.c_str());
+    if (!checked(result, properties->SetValue(linkArgumentsKey, input),
+                 "Cannot set complete shortcut arguments property.", option) ||
+        !checked(result, properties->Commit(), "Cannot commit shortcut arguments property.", option)) return false;
+    PropertyValue actual;
+    if (!checked(result, properties->GetValue(linkArgumentsKey, &actual.value),
+                 "Cannot verify arguments before saving.", option)) return false;
+    const std::wstring text = actual.value.vt == VT_LPWSTR && actual.value.pwszVal ?
+                              actual.value.pwszVal : L"";
+    if ((actual.value.vt == VT_LPWSTR || actual.value.vt == VT_EMPTY) && text == expected) return true;
+    const std::string message = "Arguments changed before Save: expected UTF-16 length=" +
+        std::to_string(expected.size()) + ", immediate property length=" + std::to_string(text.size()) +
+        ", property type=" + std::to_string(actual.value.vt) + ".";
+    error(result, "IO_ERROR", message.c_str(), option, static_cast<std::int64_t>(E_FAIL), "HRESULT");
+    return false;
+}
+
+std::string binaryArgumentsDiagnostic(const std::wstring& staged) {
+    Handle file;
+    file.value = CreateFileW(staged.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file.value == INVALID_HANDLE_VALUE) return ", StringData read error=" + std::to_string(GetLastError());
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file.value, &size) || size.QuadPart < 76 || size.QuadPart > 1024*1024)
+        return ", StringData invalid file size";
+    std::vector<unsigned char> data(static_cast<std::size_t>(size.QuadPart));
+    DWORD read = 0;
+    if (!ReadFile(file.value, data.data(), static_cast<DWORD>(data.size()), &read, nullptr) || read != data.size())
+        return ", StringData read failed";
+    const auto number = [&](std::size_t offset, std::size_t width, std::uint32_t& value) {
+        if (offset > data.size() || width > data.size() - offset) return false;
+        value = 0;
+        for (std::size_t i = 0; i < width; ++i) value |= std::uint32_t(data[offset+i]) << (8*i);
+        return true;
+    };
+    std::uint32_t flags = 0, count = 0;
+    if (!number(20, 4, flags)) return ", StringData invalid header";
+    std::size_t offset = 76;
+    if (flags & 1) {
+        if (!number(offset, 2, count)) return ", StringData invalid IDList";
+        offset += 2 + count;
+    }
+    if (flags & 2) {
+        if (!number(offset, 4, count) || count < 4) return ", StringData invalid LinkInfo";
+        offset += count;
+    }
+    for (const std::uint32_t field : {4u, 8u, 16u, 32u, 64u}) {
+        if (!(flags & field)) continue;
+        if (!number(offset, 2, count)) return ", StringData invalid string count";
+        offset += 2;
+        const std::size_t bytes = std::size_t(count) * ((flags & 128) ? 2 : 1);
+        if (offset > data.size() || bytes > data.size() - offset) return ", StringData truncated field";
+        if (field == 32)
+            return ", binary StringData argument characters=" + std::to_string(count) +
+                   ", Unicode=" + std::to_string((flags & 128) != 0);
+        offset += bytes;
+    }
+    return ", binary StringData arguments absent";
+}
+
 bool verifyPersistedArguments(Result& result, const std::wstring& staged,
                               const std::wstring& expected, const char* option) {
     ComPtr<IShellLinkW> savedLink;
@@ -139,7 +208,9 @@ bool verifyPersistedArguments(Result& result, const std::wstring& staged,
         std::to_string(expected.size()) + ", property length=" + std::to_string(actual.size()) +
         ", property type=" + std::to_string(arguments.value.vt) +
         ", GetArguments length=" + std::to_string(std::wstring(legacy.data()).size()) +
-        ", GetArguments HRESULT=" + std::to_string(static_cast<std::int64_t>(legacyStatus)) + ".";
+        ", GetArguments HRESULT=" + std::to_string(static_cast<std::int64_t>(legacyStatus)) +
+        ", pre-save property verified=" + std::to_string(expected.size()) +
+        binaryArgumentsDiagnostic(staged) + ".";
     error(result, "IO_ERROR", message.c_str(),
           option, static_cast<std::int64_t>(E_FAIL), "HRESULT");
     return false;
@@ -290,6 +361,9 @@ Result createAlias(const std::string& target, const std::string& destination,
                                      "Cannot set icon.", "iconPath")) ||
         (options.showCommand && !checked(result, link->SetShowCmd(*options.showCommand),
                                         "Cannot set show command.", "showCommand"))) return result;
+    // Commit the authoritative property after every other field has been set.
+    if (!setArgumentsProperty(result, link.value, argumentsW,
+                              options.arguments ? "arguments" : "argumentsText")) return result;
     const auto parent = destinationW.substr(0, destinationW.find_last_of(L'\\') + 1);
     std::wstring staging;
     std::string stagingPath;

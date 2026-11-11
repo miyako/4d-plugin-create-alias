@@ -80,16 +80,14 @@ std::string bytes(const fs::path& file) {
 struct Link {
     IShellLinkW* link = nullptr;
     IPersistFile* persist = nullptr;
-    explicit Link(const fs::path& file) {
+    Link() {
         hr(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
                             IID_IShellLinkW, reinterpret_cast<void**>(&link)), "Cannot create COM reader");
         const auto query = link->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&persist));
         if (FAILED(query)) { link->Release(); link = nullptr; hr(query, "Cannot query persistence"); }
-        const auto load = persist->Load(file.c_str(), STGM_READ);
-        if (FAILED(load)) {
-            persist->Release(); link->Release(); persist = nullptr; link = nullptr;
-            hr(load, "Cannot load generated shortcut");
-        }
+    }
+    explicit Link(const fs::path& file) : Link() {
+        hr(persist->Load(file.c_str(), STGM_READ), "Cannot load generated shortcut");
     }
     ~Link() { if (persist) persist->Release(); if (link) link->Release(); }
 };
@@ -160,6 +158,28 @@ std::vector<std::wstring> recorded(const fs::path& output) {
     }
     require(file.peek() == std::char_traits<char>::eof(), "Unexpected recorder bytes");
     return result;
+}
+
+void diagnoseLegacyPersistence(const fs::path& root, const fs::path& recorder) {
+    const auto probePath = root / L"legacy-setter-diagnostic.lnk";
+    require(!fs::exists(probePath), "Diagnostic fixture path unexpectedly reused");
+    Link probe;
+    hr(probe.link->SetPath(recorder.c_str()), "Cannot set diagnostic target");
+    const std::wstring text(1023, L'a');
+    hr(probe.link->SetArguments(text.c_str()), "Cannot set diagnostic arguments");
+    std::cout << "PROBE raw SetArguments immediate expected UTF-16=1023\n" << std::flush;
+    const auto immediate = storedArguments(probe);
+    const std::wstring description(1023, L'd');
+    hr(probe.link->SetDescription(description.c_str()), "Cannot set diagnostic description");
+    std::cout << "PROBE raw SetArguments after SetDescription\n" << std::flush;
+    const auto afterDescription = storedArguments(probe);
+    hr(probe.persist->Save(probePath.c_str(), TRUE), "Cannot save diagnostic shortcut");
+    Link reloaded(probePath);
+    std::cout << "PROBE raw SetArguments fresh reload\n" << std::flush;
+    const auto persisted = storedArguments(reloaded);
+    std::cout << "PROBE UTF-8 ASCII lengths immediate=" << immediate.size()
+              << ", after-description=" << afterDescription.size()
+              << ", persisted=" << persisted.size() << '\n' << std::flush;
 }
 
 void launch(const fs::path& shortcut, const fs::path& output,
@@ -242,6 +262,23 @@ void readback(const fs::path& root, const fs::path& recorder) {
     Link folder(root / L"folder.lnk");
     hr(folder.link->GetPath(buffer, 32767, nullptr, SLGP_RAWPATH), "Cannot read folder target");
     require(fs::path(buffer) == working, "Folder target mismatch");
+}
+
+void boundaryReadback(const fs::path& root, const fs::path& recorder) {
+    wchar_t buffer[32767]{};
+    std::cout << "STAGE independent argument-only boundary fixture\n" << std::flush;
+    Options argumentOnly;
+    argumentOnly.argumentsText = std::string(1023, 'a');
+    success(alias_plugin::createAlias(path(recorder), path(root / L"argument-only-boundary"), argumentOnly));
+    Link argumentOnlyLink(root / L"argument-only-boundary.lnk");
+    exactArguments(argumentOnlyLink, *argumentOnly.argumentsText, "Argument-only boundary mismatch");
+    std::cout << "STAGE independent description-only boundary fixture\n" << std::flush;
+    Options descriptionOnly;
+    descriptionOnly.description = std::string(1023, 'd');
+    success(alias_plugin::createAlias(path(recorder), path(root / L"description-only-boundary"), descriptionOnly));
+    Link descriptionOnlyLink(root / L"description-only-boundary.lnk");
+    hr(descriptionOnlyLink.link->GetDescription(buffer, 32767), "Cannot read description-only boundary");
+    require(utf8(buffer) == *descriptionOnly.description, "Description-only boundary mismatch");
     Options boundary;
     boundary.description = std::string(1023, 'd');
     boundary.argumentsText = std::string(1023, 'a');
@@ -273,6 +310,9 @@ void launchArguments(const fs::path& root, const fs::path& recorder) {
     Options none;
     success(alias_plugin::createAlias(path(recorder), path(root / L"none"), none));
     launch(root / L"none.lnk", root / L"none.bin", {});
+}
+
+void launchBoundaries(const fs::path& root, const fs::path& recorder) {
     Options rawBoundary;
     rawBoundary.argumentsText = std::string(1023, 'a');
     success(alias_plugin::createAlias(path(recorder), path(root / L"raw-boundary"), rawBoundary));
@@ -504,10 +544,17 @@ int wmain(int argc, wchar_t** argv) {
         const fs::path source = fs::absolute(argv[1]);
         const fs::path recorder = root.value / L"recorder space \u65e5\u672c\u8a9e.exe";
         fs::copy_file(source, recorder);
+        std::cout << "STAGE ordinary real shortcut argv launches\n" << std::flush;
+        launchArguments(root.value, recorder);
+        std::cout << "PASS ordinary real shortcut argv acceptance\n" << std::flush;
         std::cout << "STAGE property readback\n" << std::flush;
         readback(root.value, recorder);
-        std::cout << "STAGE real shortcut argv launches and supported boundaries\n" << std::flush;
-        launchArguments(root.value, recorder);
+        std::cout << "STAGE independent legacy setter/persistence diagnosis\n" << std::flush;
+        diagnoseLegacyPersistence(root.value, recorder);
+        std::cout << "STAGE supported field boundary readback\n" << std::flush;
+        boundaryReadback(root.value, recorder);
+        std::cout << "STAGE real shortcut supported boundary launches\n" << std::flush;
+        launchBoundaries(root.value, recorder);
         std::cout << "STAGE validation and overwrite preservation\n" << std::flush;
         failures(root.value, recorder);
         std::cout << "STAGE concurrent no-clobber publication\n" << std::flush;
