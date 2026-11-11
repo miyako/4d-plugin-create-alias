@@ -1,5 +1,5 @@
 //%attributes = {"invisible":true}
-var $root : 4D.Folder
+var $root; $folder : 4D.Folder
 var $target; $alias : 4D.File
 var $status; $options; $invalidOption : Object
 var $invalidOptions : Collection
@@ -90,4 +90,17 @@ $status:=CREATE_ALIAS_EX($target.platformPath; $target.platformPath; New object(
 ASSERT(OK=53)
 ASSERT($status.OK=False)
 ASSERT($target.getText()="original")
+
+$folder:=$root.folder("folder target")
+$folder.create()
+OK:=61
+$status:=CREATE_ALIAS_EX($folder.platformPath; $root.file("folder alias").platformPath)
+ASSERT(OK=61)
+ASSERT($status.OK=True; JSON Stringify($status))
+ASSERT(Compare strings($status.targetPath; $folder.platformPath; sk char codes)=0)
+$alias:=File($status.aliasPath; fk platform path)
+ASSERT($alias.isAlias)
+RESOLVE ALIAS($alias.platformPath; $resolvedPath)
+ASSERT(OK=1)
+ASSERT(Compare strings($resolvedPath; $folder.platformPath; sk char codes)=0)
 $root.delete(Delete with contents)
