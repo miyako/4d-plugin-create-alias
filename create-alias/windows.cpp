@@ -98,6 +98,28 @@ bool sameFile(const BY_HANDLE_FILE_INFORMATION& a, const BY_HANDLE_FILE_INFORMAT
            a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow;
 }
 
+bool verifyPersistedArguments(Result& result, const std::wstring& staged,
+                              const std::wstring& expected, const char* option) {
+    ComPtr<IShellLinkW> savedLink;
+    ComPtr<IPersistFile> savedFile;
+    if (!checked(result, CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                 IID_IShellLinkW, reinterpret_cast<void**>(&savedLink.value)),
+                 "Cannot create persisted shortcut verifier.") ||
+        !checked(result, savedLink->QueryInterface(IID_IPersistFile,
+                 reinterpret_cast<void**>(&savedFile.value)), "Cannot obtain persisted shortcut verifier.") ||
+        !checked(result, savedFile->Load(staged.c_str(), STGM_READ),
+                 "Cannot reload staged shortcut.")) return false;
+    // Reload a new COM object: the original object can retain the entire input
+    // even when Shell Link persistence subsequently truncates it.
+    std::vector<wchar_t> readback(32767);
+    const HRESULT status = savedLink->GetArguments(readback.data(), static_cast<int>(readback.size()));
+    if (!checked(result, status, "Cannot read persisted shortcut arguments.", option)) return false;
+    if (expected == readback.data()) return true;
+    error(result, "IO_ERROR", "Persisted Shell Link changed or truncated the arguments.",
+          option, static_cast<std::int64_t>(E_FAIL), "HRESULT");
+    return false;
+}
+
 }
 
 Result createAlias(const std::string& target, const std::string& destination,
@@ -143,7 +165,9 @@ Result createAlias(const std::string& target, const std::string& destination,
     if (!wide(result, options.arguments ? quoteArguments(*options.arguments) :
               options.argumentsText.value_or(""), argumentsW,
               options.arguments ? "arguments" : "argumentsText") ||
-        !bounded(result, argumentsW, 32766, options.arguments ? "arguments" : "argumentsText"))
+        // Use the conservative Shell Link field bound, not CreateProcess's much
+        // larger command-line bound. Persistence must still be verified below.
+        !bounded(result, argumentsW, INFOTIPSIZE-1, options.arguments ? "arguments" : "argumentsText"))
         return result;
     const auto pathOption = [&](const std::optional<std::string>& value,
                                 std::wstring& output, const char* name) {
@@ -265,13 +289,9 @@ Result createAlias(const std::string& target, const std::string& destination,
     bool published = false;
     bool keepBackup = false;
     if (checked(result, persist->Save(staged.c_str(), TRUE), "Cannot save staged shortcut.")) {
-        std::vector<wchar_t> argumentsReadback(32767);
-        const HRESULT readStatus = link->GetArguments(argumentsReadback.data(),
-                                                      static_cast<int>(argumentsReadback.size()));
-        if (FAILED(readStatus) || argumentsW != argumentsReadback.data()) {
-            error(result, "IO_ERROR", "Shell Link did not retain the complete arguments.", "arguments",
-                  static_cast<std::int64_t>(FAILED(readStatus) ? readStatus : E_FAIL), "HRESULT");
-        } else if (existing.value != INVALID_HANDLE_VALUE) {
+        const bool persisted = verifyPersistedArguments(result, staged, argumentsW,
+                                                        options.arguments ? "arguments" : "argumentsText");
+        if (persisted && existing.value != INVALID_HANDLE_VALUE) {
             Handle current;
             current.value = CreateFileW(destinationW.c_str(), GENERIC_READ,
                                        FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
@@ -312,7 +332,7 @@ Result createAlias(const std::string& target, const std::string& destination,
                 if (status != ERROR_FILE_NOT_FOUND)
                     error(result, "CLEANUP_FAILED", "Cannot remove original shortcut backup.", "aliasPath", status);
             }
-        } else {
+        } else if (persisted) {
             published = MoveFileExW(staged.c_str(), destinationW.c_str(), 0) != FALSE;
             if (!published) {
                 const DWORD status = GetLastError();

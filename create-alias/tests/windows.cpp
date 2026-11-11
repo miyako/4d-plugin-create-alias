@@ -200,7 +200,7 @@ void readback(const fs::path& root, const fs::path& recorder) {
     require(fs::path(buffer) == working, "Folder target mismatch");
     Options boundary;
     boundary.description = std::string(1023, 'd');
-    boundary.argumentsText = std::string(32766, 'a');
+    boundary.argumentsText = std::string(1023, 'a');
     success(alias_plugin::createAlias(path(recorder), path(root / L"field-boundaries"), boundary));
     Link boundaryLink(root / L"field-boundaries.lnk");
     hr(boundaryLink.link->GetArguments(buffer, 32767), "Cannot read maximum arguments");
@@ -231,6 +231,14 @@ void launchArguments(const fs::path& root, const fs::path& recorder) {
     Options none;
     success(alias_plugin::createAlias(path(recorder), path(root / L"none"), none));
     launch(root / L"none.lnk", root / L"none.bin", {});
+    Options rawBoundary;
+    rawBoundary.argumentsText = std::string(1023, 'a');
+    success(alias_plugin::createAlias(path(recorder), path(root / L"raw-boundary"), rawBoundary));
+    launch(root / L"raw-boundary.lnk", root / L"raw-boundary.bin", {std::wstring(1023, L'a')});
+    Options quotedBoundary;
+    quotedBoundary.arguments = std::vector<std::string>{std::string(1021, 'q')};
+    success(alias_plugin::createAlias(path(recorder), path(root / L"quoted-boundary"), quotedBoundary));
+    launch(root / L"quoted-boundary.lnk", root / L"quoted-boundary.bin", {std::wstring(1021, L'q')});
 }
 
 void failures(const fs::path& root, const fs::path& recorder) {
@@ -268,8 +276,14 @@ void failures(const fs::path& root, const fs::path& recorder) {
     options = {};
     options.argumentsText = std::string(32767, 'x');
     reject(path(recorder), options, "INVALID_OPTION");
+    options.argumentsText = std::string(32766, 'x');
+    reject(path(recorder), options, "INVALID_OPTION");
+    options.argumentsText = std::string(1024, 'x');
+    reject(path(recorder), options, "INVALID_OPTION");
     options = {};
     options.arguments = std::vector<std::string>{std::string(32765, 'x')};
+    reject(path(recorder), options, "INVALID_OPTION");
+    options.arguments = std::vector<std::string>{std::string(1022, 'x')};
     reject(path(recorder), options, "INVALID_OPTION");
     options = {};
     options.arguments = std::vector<std::string>{std::string("a\0b", 3)};
@@ -321,6 +335,17 @@ void failures(const fs::path& root, const fs::path& recorder) {
     const auto originalLink = bytes(existing);
     failure(alias_plugin::createAlias(path(recorder), path(existing), {}), "DESTINATION_EXISTS");
     require(bytes(existing) == originalLink, "Default mode overwrote a real shortcut");
+    Options excessive;
+    excessive.overwrite = true;
+    for (const std::size_t length : {std::size_t{1024}, std::size_t{32766}}) {
+        excessive.argumentsText = std::string(length, 'x');
+        failure(alias_plugin::createAlias(path(recorder), path(existing), excessive), "INVALID_OPTION");
+        require(bytes(existing) == originalLink, "Overlong raw arguments changed the existing shortcut");
+    }
+    excessive.argumentsText.reset();
+    excessive.arguments = std::vector<std::string>{std::string(1022, 'x')};
+    failure(alias_plugin::createAlias(path(recorder), path(existing), excessive), "INVALID_OPTION");
+    require(bytes(existing) == originalLink, "Overlong serialized arguments changed the existing shortcut");
     options.description = "replacement";
     require(SetFileAttributesW(existing.c_str(), FILE_ATTRIBUTE_READONLY) != FALSE,
             "Cannot make shortcut read-only");
