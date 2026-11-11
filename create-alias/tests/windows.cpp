@@ -83,6 +83,7 @@ std::string bytes(const fs::path& file) {
 struct Link {
     IShellLinkW* link = nullptr;
     IPersistFile* persist = nullptr;
+    fs::path sourceFile;
     Link() {
         hr(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
                             IID_IShellLinkW, reinterpret_cast<void**>(&link)), "Cannot create COM reader");
@@ -91,9 +92,52 @@ struct Link {
     }
     explicit Link(const fs::path& file) : Link() {
         hr(persist->Load(file.c_str(), STGM_READ), "Cannot load generated shortcut");
+        sourceFile = file;
     }
     ~Link() { if (persist) persist->Release(); if (link) link->Release(); }
 };
+
+std::wstring binaryDescription(const fs::path& file) {
+    std::ifstream input(file, std::ios::binary);
+    require(input.good(), "Cannot read binary description fixture");
+    const auto number = [&](unsigned width) {
+        std::uint32_t value = 0;
+        for (unsigned i = 0; i < width; ++i) {
+            const auto byte = input.get();
+            require(byte != std::char_traits<char>::eof(), "Truncated binary description fixture");
+            value |= static_cast<std::uint32_t>(static_cast<unsigned char>(byte)) << (8*i);
+        }
+        return value;
+    };
+    require(number(4) == 76, "Invalid Shell Link header");
+    input.seekg(20);
+    const auto flags = number(4);
+    input.seekg(76);
+    if (flags & 1) {
+        const auto count = number(2);
+        input.seekg(count, std::ios::cur);
+    }
+    if (flags & 2) {
+        const auto count = number(4);
+        require(count >= 4, "Invalid Shell Link LinkInfo");
+        input.seekg(count-4, std::ios::cur);
+    }
+    if (!(flags & 4)) return {};
+    const auto count = number(2);
+    std::wstring result;
+    if (flags & 128) {
+        for (std::uint32_t i = 0; i < count; ++i) result += static_cast<wchar_t>(number(2));
+    } else if (count) {
+        std::string bytes(count, '\0');
+        input.read(bytes.data(), count);
+        require(input.good(), "Truncated ANSI description");
+        const int length = MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
+        require(length != 0, "Cannot decode ANSI description");
+        result.resize(length);
+        MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), result.data(), length);
+    }
+    return result;
+}
 
 std::wstring storedProperty(Link& saved, REFPROPERTYKEY key) {
     IPropertyStore* properties = nullptr;
@@ -121,11 +165,13 @@ std::string storedArguments(Link& saved) {
 }
 
 void exactDescription(Link& saved, const std::string& expected, const char* message) {
-    const auto actual = storedProperty(saved, commentKey);
+    const auto actual = binaryDescription(saved.sourceFile);
+    const auto property = storedProperty(saved, commentKey);
     std::vector<wchar_t> legacy(32767);
     const auto status = saved.link->GetDescription(legacy.data(), static_cast<int>(legacy.size()));
     std::cout << "DESCRIPTION expected UTF-8 bytes=" << expected.size()
-              << ", property UTF-16=" << actual.size()
+              << ", binary UTF-16=" << actual.size()
+              << ", property UTF-16=" << property.size()
               << ", GetDescription UTF-16=" << std::wstring(legacy.data()).size()
               << ", HRESULT=" << static_cast<std::int64_t>(status) << '\n' << std::flush;
     const auto encoded = utf8(actual);
@@ -133,6 +179,35 @@ void exactDescription(Link& saved, const std::string& expected, const char* mess
         throw std::runtime_error(std::string(message) + ": expected UTF-8 bytes=" +
                                  std::to_string(expected.size()) + ", actual UTF-8 bytes=" +
                                  std::to_string(encoded.size()));
+}
+
+void probeDescriptionLengths(const fs::path& root, const fs::path& recorder) {
+    for (const int length : {99, 100, 101, 259, 260, 261, 1023}) {
+        const auto file = root / (std::wstring(L"description-probe-") + std::to_wstring(length) + L".lnk");
+        require(!fs::exists(file), "Description probe path reused");
+        Link link;
+        hr(link.link->SetPath(recorder.c_str()), "Cannot set description probe target");
+        const std::wstring expected(length, L'd');
+        hr(link.link->SetDescription(expected.c_str()), "Cannot set description probe value");
+        std::vector<wchar_t> immediate(32767);
+        hr(link.link->GetDescription(immediate.data(), static_cast<int>(immediate.size())),
+           "Cannot read immediate probe description");
+        const auto immediateProperty = storedProperty(link, commentKey);
+        hr(link.persist->Save(file.c_str(), TRUE), "Cannot save description probe");
+        Link reloaded(file);
+        const auto property = storedProperty(reloaded, commentKey);
+        const auto binary = binaryDescription(file);
+        std::vector<wchar_t> legacy(32767);
+        hr(reloaded.link->GetDescription(legacy.data(), static_cast<int>(legacy.size())),
+           "Cannot read reloaded probe description");
+        std::cout << "DESCRIPTION PROBE expected=" << length
+                  << ", immediate GetDescription=" << std::wstring(immediate.data()).size()
+                  << ", immediate property=" << immediateProperty.size()
+                  << ", persisted property=" << property.size()
+                  << ", persisted GetDescription=" << std::wstring(legacy.data()).size()
+                  << ", binary StringData=" << binary.size()
+                  << ", binary exact=" << (binary == expected) << '\n' << std::flush;
+    }
 }
 
 void exactArguments(Link& saved, const std::string& expected, const char* message) {
@@ -576,6 +651,8 @@ int wmain(int argc, wchar_t** argv) {
         std::cout << "STAGE ordinary real shortcut argv launches\n" << std::flush;
         launchArguments(root.value, recorder);
         std::cout << "PASS ordinary real shortcut argv acceptance\n" << std::flush;
+        std::cout << "STAGE direct description length probes\n" << std::flush;
+        probeDescriptionLengths(root.value, recorder);
         std::cout << "STAGE property readback\n" << std::flush;
         readback(root.value, recorder);
         std::cout << "STAGE independent legacy setter/persistence diagnosis\n" << std::flush;

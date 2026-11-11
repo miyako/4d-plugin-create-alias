@@ -19,9 +19,6 @@ namespace {
 constexpr PROPERTYKEY linkArgumentsKey = {
     {0x436f2667, 0x14e2, 0x4feb, {0xb3, 0x0a, 0x14, 0x6c, 0x53, 0xb5, 0xb6, 0x74}}, 100
 };
-constexpr PROPERTYKEY commentKey = {
-    {0xf29f85e0, 0x4ff9, 0x1068, {0xab, 0x91, 0x08, 0x00, 0x2b, 0x27, 0xb3, 0xd9}}, 6
-};
 
 struct PropertyValue {
     PROPVARIANT value{};
@@ -130,7 +127,7 @@ bool verifyTextProperty(Result& result, IPropertyStore* properties, REFPROPERTYK
 }
 
 bool setTextProperties(Result& result, IShellLinkW* link, const std::wstring& expected,
-                       const char* option, const std::wstring* description) {
+                       const char* option) {
     ComPtr<IPropertyStore> properties;
     if (!checked(result, link->QueryInterface(IID_IPropertyStore,
                  reinterpret_cast<void**>(&properties.value)), "Cannot obtain writable shortcut properties.", option))
@@ -141,15 +138,8 @@ bool setTextProperties(Result& result, IShellLinkW* link, const std::wstring& ex
     input.pwszVal = const_cast<wchar_t*>(expected.c_str());
     if (!checked(result, properties->SetValue(linkArgumentsKey, input),
                  "Cannot set complete shortcut arguments property.", option)) return false;
-    if (description) {
-        input.pwszVal = const_cast<wchar_t*>(description->c_str());
-        if (!checked(result, properties->SetValue(commentKey, input),
-                     "Cannot set complete shortcut description property.", "description")) return false;
-    }
     if (!checked(result, properties->Commit(), "Cannot commit shortcut text properties.", option)) return false;
-    return verifyTextProperty(result, properties.value, linkArgumentsKey, expected, option, "Before Save") &&
-           (!description || verifyTextProperty(result, properties.value, commentKey, *description,
-                                                "description", "Before Save"));
+    return verifyTextProperty(result, properties.value, linkArgumentsKey, expected, option, "Before Save");
 }
 
 bool samePath(const std::wstring& first, const std::wstring& second) {
@@ -167,18 +157,25 @@ bool samePath(const std::wstring& first, const std::wstring& second) {
            CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
 }
 
-std::string binaryArgumentsDiagnostic(const std::wstring& staged, std::uint32_t wanted = 32) {
+struct BinaryString {
+    bool valid = false;
+    std::wstring text;
+    std::string diagnostic;
+};
+
+BinaryString readStringData(const std::wstring& staged, std::uint32_t wanted = 32) {
+    const auto fail = [](const std::string& diagnostic) { return BinaryString{false, {}, diagnostic}; };
     Handle file;
     file.value = CreateFileW(staged.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file.value == INVALID_HANDLE_VALUE) return ", StringData read error=" + std::to_string(GetLastError());
+    if (file.value == INVALID_HANDLE_VALUE) return fail(", StringData read error=" + std::to_string(GetLastError()));
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(file.value, &size) || size.QuadPart < 76 || size.QuadPart > 1024*1024)
-        return ", StringData invalid file size";
+        return fail(", StringData invalid file size");
     std::vector<unsigned char> data(static_cast<std::size_t>(size.QuadPart));
     DWORD read = 0;
     if (!ReadFile(file.value, data.data(), static_cast<DWORD>(data.size()), &read, nullptr) || read != data.size())
-        return ", StringData read failed";
+        return fail(", StringData read failed");
     const auto number = [&](std::size_t offset, std::size_t width, std::uint32_t& value) {
         if (offset > data.size() || width > data.size() - offset) return false;
         value = 0;
@@ -186,29 +183,43 @@ std::string binaryArgumentsDiagnostic(const std::wstring& staged, std::uint32_t 
         return true;
     };
     std::uint32_t flags = 0, count = 0;
-    if (!number(20, 4, flags)) return ", StringData invalid header";
+    if (!number(0, 4, count) || count != 76 || !number(20, 4, flags)) return fail(", StringData invalid header");
     std::size_t offset = 76;
     if (flags & 1) {
-        if (!number(offset, 2, count)) return ", StringData invalid IDList";
+        if (!number(offset, 2, count)) return fail(", StringData invalid IDList");
         offset += 2 + count;
     }
     if (flags & 2) {
-        if (!number(offset, 4, count) || count < 4) return ", StringData invalid LinkInfo";
+        if (!number(offset, 4, count) || count < 4) return fail(", StringData invalid LinkInfo");
         offset += count;
     }
     for (const std::uint32_t field : {4u, 8u, 16u, 32u, 64u}) {
         if (!(flags & field)) continue;
-        if (!number(offset, 2, count)) return ", StringData invalid string count";
+        if (!number(offset, 2, count)) return fail(", StringData invalid string count");
         offset += 2;
         const std::size_t bytes = std::size_t(count) * ((flags & 128) ? 2 : 1);
-        if (offset > data.size() || bytes > data.size() - offset) return ", StringData truncated field";
-        if (field == wanted)
-            return std::string(", binary StringData ") + (wanted == 4 ? "description" : "argument") +
-                   " characters=" + std::to_string(count) +
-                   ", Unicode=" + std::to_string((flags & 128) != 0);
+        if (offset > data.size() || bytes > data.size() - offset) return fail(", StringData truncated field");
+        if (field == wanted) {
+            std::wstring text;
+            if (flags & 128) {
+                text.reserve(count);
+                for (std::size_t i = 0; i < count; ++i)
+                    text += static_cast<wchar_t>(data[offset+2*i] | (std::uint32_t(data[offset+2*i+1]) << 8));
+            } else if (count) {
+                const int length = MultiByteToWideChar(CP_ACP, 0, reinterpret_cast<const char*>(data.data()+offset),
+                                                        static_cast<int>(count), nullptr, 0);
+                if (!length) return fail(", StringData ANSI decoding failed");
+                text.resize(length);
+                MultiByteToWideChar(CP_ACP, 0, reinterpret_cast<const char*>(data.data()+offset),
+                                    static_cast<int>(count), text.data(), length);
+            }
+            return {true, std::move(text), std::string(", binary StringData ") +
+                    (wanted == 4 ? "description" : "argument") + " characters=" + std::to_string(count) +
+                    ", Unicode=" + std::to_string((flags & 128) != 0)};
+        }
         offset += bytes;
     }
-    return ", binary StringData requested field absent";
+    return {true, {}, ", binary StringData requested field absent"};
 }
 
 bool verifyPersistedFields(Result& result, const std::wstring& staged,
@@ -234,10 +245,19 @@ bool verifyPersistedFields(Result& result, const std::wstring& staged,
     const std::wstring actual = arguments.value.vt == VT_LPWSTR && arguments.value.pwszVal ?
                                 arguments.value.pwszVal : L"";
     if (validType && expected == actual) {
-        if (options.description && !verifyTextProperty(result, properties.value, commentKey, description,
-                                                       "description", "Persisted")) {
-            result.errors.back().message += binaryArgumentsDiagnostic(staged, 4);
-            return false;
+        if (options.description) {
+            const auto stored = readStringData(staged, 4);
+            if (!stored.valid || stored.text != description) {
+                std::vector<wchar_t> legacy(32767);
+                const auto status = savedLink->GetDescription(legacy.data(), static_cast<int>(legacy.size()));
+                const std::string message = "Persisted description mismatch: expected UTF-16 length=" +
+                    std::to_string(description.size()) + ", binary length=" + std::to_string(stored.text.size()) +
+                    ", GetDescription length=" + std::to_string(std::wstring(legacy.data()).size()) +
+                    ", GetDescription HRESULT=" + std::to_string(static_cast<std::int64_t>(status)) +
+                    stored.diagnostic + ".";
+                error(result, "IO_ERROR", message.c_str(), "description", static_cast<std::int64_t>(E_FAIL), "HRESULT");
+                return false;
+            }
         }
         std::vector<wchar_t> buffer(32767);
         const auto pathMatches = [&](const std::wstring& value, const char* field) {
@@ -283,7 +303,7 @@ bool verifyPersistedFields(Result& result, const std::wstring& staged,
         ", GetArguments length=" + std::to_string(std::wstring(legacy.data()).size()) +
         ", GetArguments HRESULT=" + std::to_string(static_cast<std::int64_t>(legacyStatus)) +
         ", pre-save property verified=" + std::to_string(expected.size()) +
-        binaryArgumentsDiagnostic(staged) + ".";
+        readStringData(staged).diagnostic + ".";
     error(result, "IO_ERROR", message.c_str(),
           option, static_cast<std::int64_t>(E_FAIL), "HRESULT");
     return false;
@@ -435,8 +455,8 @@ Result createAlias(const std::string& target, const std::string& destination,
         (options.showCommand && !checked(result, link->SetShowCmd(*options.showCommand),
                                         "Cannot set show command.", "showCommand"))) return result;
     // Commit the authoritative property after every other field has been set.
-    if (!setTextProperties(result, link.value, argumentsW, options.arguments ? "arguments" : "argumentsText",
-                           options.description ? &descriptionW : nullptr)) return result;
+    if (!setTextProperties(result, link.value, argumentsW, options.arguments ? "arguments" : "argumentsText"))
+        return result;
     const auto parent = destinationW.substr(0, destinationW.find_last_of(L'\\') + 1);
     std::wstring staging;
     std::string stagingPath;
