@@ -1,5 +1,12 @@
 # Native plugin pipeline
 
+> **Create Alias:** this product retains the canonical generator and templates
+> copied from `miyako/4d-plugin-tutorial`. Its active configuration is
+> `.github/plugin-pipeline.json`; the three generated workflows are active here.
+> References below to an inert `main`, the `example` branch, or separate example
+> delivery describe the **source tutorial**, not this product repository.
+> Product build/API instructions are in [README.md](../README.md).
+
 This repository owns native-plugin generation instructions and pipeline source.
 Installed skills may consume these files, but must not maintain forked workflow
 architectures. Component CI/Publish and no-prefix tags are separate conventions.

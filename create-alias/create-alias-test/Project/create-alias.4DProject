@@ -1,0 +1,4 @@
+{
+    "$comment": "4D v20-compatible host tests; CI uses the available 20.6 LTS runtime",
+    "compatibilityVersion": 2006
+}

@@ -258,13 +258,21 @@ class PipelineGenerationTests(unittest.TestCase):
     def test_yaml_contract(self):
         self.assert_rendered_contract()
 
-    def test_exactly_three_inert_canonical_workflows(self):
+    def test_exactly_three_canonical_workflows(self):
         paths = set((ROOT / "templates/plugin-pipeline").glob("*.yml.in"))
         self.assertEqual({path.name for path in paths}, {
             "bump-version.yml.in", "test.yml.in", "release.yml.in", "tool4d-test.action.yml.in",
         })
         self.assertEqual(len(parsed(self.rendered())), 3)
-        self.assertFalse(list((ROOT / ".github/workflows").glob("*.yml")))
+        config_path = ROOT / ".github/plugin-pipeline.json"
+        if config_path.exists():
+            self.assertEqual(
+                {path.name for path in (ROOT / ".github/workflows").glob("*.yml")},
+                {"bump-version.yml", "test.yml", "release.yml"},
+            )
+            generator.generate(json.loads(config_path.read_text()), ROOT, check=True)
+        else:
+            self.assertFalse(list((ROOT / ".github/workflows").glob("*.yml")))
         self.assertFalse(list((ROOT / ".github/workflows").glob("*.yaml")))
 
     def test_deterministic_idempotent_and_check(self):

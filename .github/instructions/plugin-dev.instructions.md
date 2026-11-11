@@ -4,6 +4,13 @@ applyTo: "**"
 
 # 4D Plugin Development Guide
 
+**This product:** `CREATE_ALIAS_EX` is a native cooperative 4D v20 plug-in.
+Follow [the product contract](../../README.md) for its API, paths, errors and
+validation. The tutorial guidance below is retained as scaffold provenance;
+its runnable `example` branch and inert tutorial `main` are not this product's
+branches. Generate this repository's pipeline from
+`.github/plugin-pipeline.json`; do not hand-edit managed outputs.
+
 A comprehensive reference for building a 4D plugin from scratch in C/C++. This document captures the full workflow, conventions, caveats, and tips needed to create, build, test, and ship a 4D plugin on macOS and Windows.
 
 **Canonical generated pipeline:** follow [Plugin pipeline generation](../../docs/plugin-pipeline.md)

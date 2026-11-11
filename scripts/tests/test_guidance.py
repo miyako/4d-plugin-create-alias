@@ -32,9 +32,14 @@ class GuidanceTests(unittest.TestCase):
 
     def test_readme_identifies_real_branch_and_generation_owner(self):
         readme = (ROOT / "README.md").read_text()
-        self.assertIn("tree/example", readme)
         self.assertIn("docs/plugin-pipeline.md", readme)
-        self.assertIn("updated separately", readme)
+        if (ROOT / ".github/plugin-pipeline.json").exists():
+            self.assertIn("CREATE_ALIAS_EX", readme)
+            self.assertIn("README.ja.md", readme)
+            self.assertIn("not authorization to release", readme.replace("**", ""))
+        else:
+            self.assertIn("tree/example", readme)
+            self.assertIn("updated separately", readme)
 
     def test_example_overlay_has_versioned_bundle_contract(self):
         cmake = (ROOT / "templates/example-overlay/CMakeLists.txt").read_text()
