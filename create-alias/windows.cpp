@@ -19,6 +19,9 @@ namespace {
 constexpr PROPERTYKEY linkArgumentsKey = {
     {0x436f2667, 0x14e2, 0x4feb, {0xb3, 0x0a, 0x14, 0x6c, 0x53, 0xb5, 0xb6, 0x74}}, 100
 };
+constexpr PROPERTYKEY commentKey = {
+    {0xf29f85e0, 0x4ff9, 0x1068, {0xab, 0x91, 0x08, 0x00, 0x2b, 0x27, 0xb3, 0xd9}}, 6
+};
 
 struct PropertyValue {
     PROPVARIANT value{};
@@ -247,9 +250,14 @@ bool verifyPersistedFields(Result& result, const std::wstring& staged,
     if (validType && expected == actual) {
         if (options.description) {
             const auto stored = readStringData(staged, 4);
-            if (!stored.valid || stored.text != description) {
-                std::vector<wchar_t> legacy(32767);
-                const auto status = savedLink->GetDescription(legacy.data(), static_cast<int>(legacy.size()));
+            if (!verifyTextProperty(result, properties.value, commentKey, description, "description", "Persisted")) {
+                result.errors.back().message += stored.diagnostic;
+                return false;
+            }
+            std::vector<wchar_t> legacy(32767);
+            const auto status = savedLink->GetDescription(legacy.data(), static_cast<int>(legacy.size()));
+            if (!checked(result, status, "Cannot verify persisted description.", "description")) return false;
+            if (!stored.valid || stored.text != description || std::wstring(legacy.data()) != description) {
                 const std::string message = "Persisted description mismatch: expected UTF-16 length=" +
                     std::to_string(description.size()) + ", binary length=" + std::to_string(stored.text.size()) +
                     ", GetDescription length=" + std::to_string(std::wstring(legacy.data()).size()) +
@@ -372,7 +380,9 @@ Result createAlias(const std::string& target, const std::string& destination,
         !pathOption(options.iconPath, iconW, "iconPath")) return result;
     if (options.description &&
         (!wide(result, *options.description, descriptionW, "description") ||
-         !bounded(result, descriptionW, INFOTIPSIZE-1, "description"))) return result;
+         // Longer NameString values survive on disk but Windows consumers can
+         // misread subsequent fields. 259 is the measured exact reader boundary.
+         !bounded(result, descriptionW, MAX_PATH-1, "description"))) return result;
     const DWORD targetAttributes = GetFileAttributesW(targetW.c_str());
     if (targetAttributes == INVALID_FILE_ATTRIBUTES) {
         const DWORD status = GetLastError();

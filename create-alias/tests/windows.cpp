@@ -175,10 +175,12 @@ void exactDescription(Link& saved, const std::string& expected, const char* mess
               << ", GetDescription UTF-16=" << std::wstring(legacy.data()).size()
               << ", HRESULT=" << static_cast<std::int64_t>(status) << '\n' << std::flush;
     const auto encoded = utf8(actual);
-    if (encoded != expected)
+    if (encoded != expected || utf8(property) != expected || utf8(legacy.data()) != expected || FAILED(status))
         throw std::runtime_error(std::string(message) + ": expected UTF-8 bytes=" +
                                  std::to_string(expected.size()) + ", actual UTF-8 bytes=" +
-                                 std::to_string(encoded.size()));
+                                 std::to_string(encoded.size()) + ", property UTF-8 bytes=" +
+                                 std::to_string(utf8(property).size()) + ", GetDescription UTF-16=" +
+                                 std::to_string(std::wstring(legacy.data()).size()));
 }
 
 void probeDescriptionLengths(const fs::path& root, const fs::path& recorder) {
@@ -376,18 +378,23 @@ void boundaryReadback(const fs::path& root, const fs::path& recorder) {
     exactArguments(argumentOnlyLink, *argumentOnly.argumentsText, "Argument-only boundary mismatch");
     std::cout << "STAGE independent description-only boundary fixture\n" << std::flush;
     Options descriptionOnly;
-    descriptionOnly.description = std::string(1023, 'd');
+    descriptionOnly.description = std::string(259, 'd');
     success(alias_plugin::createAlias(path(recorder), path(root / L"description-only-boundary"), descriptionOnly));
     Link descriptionOnlyLink(root / L"description-only-boundary.lnk");
     exactDescription(descriptionOnlyLink, *descriptionOnly.description, "Description-only boundary mismatch");
     Options boundary;
-    boundary.description = std::string(1023, 'd');
+    boundary.description = std::string(259, 'd');
     boundary.argumentsText = std::string(1023, 'a');
-    std::cout << "STAGE readback supported boundary: arguments=1023, description=1023\n" << std::flush;
+    std::cout << "STAGE readback supported boundary: arguments=1023, description=259\n" << std::flush;
     success(alias_plugin::createAlias(path(recorder), path(root / L"field-boundaries"), boundary));
     Link boundaryLink(root / L"field-boundaries.lnk");
     exactArguments(boundaryLink, *boundary.argumentsText, "Maximum argument property field was truncated");
     exactDescription(boundaryLink, *boundary.description, "Maximum description was truncated");
+    Options unicodeBoundary;
+    unicodeBoundary.description = utf8(std::wstring(259, L'\u65e5'));
+    success(alias_plugin::createAlias(path(recorder), path(root / L"unicode-description-boundary"), unicodeBoundary));
+    Link unicodeDescription(root / L"unicode-description-boundary.lnk");
+    exactDescription(unicodeDescription, *unicodeBoundary.description, "Unicode description boundary mismatch");
 }
 
 void launchArguments(const fs::path& root, const fs::path& recorder) {
@@ -415,11 +422,20 @@ void launchArguments(const fs::path& root, const fs::path& recorder) {
 void launchBoundaries(const fs::path& root, const fs::path& recorder) {
     Options rawBoundary;
     rawBoundary.argumentsText = std::string(1023, 'a');
+    rawBoundary.description = std::string(259, 'd');
     success(alias_plugin::createAlias(path(recorder), path(root / L"raw-boundary"), rawBoundary));
+    Link rawLink(root / L"raw-boundary.lnk");
+    exactArguments(rawLink, *rawBoundary.argumentsText, "Combined raw boundary arguments mismatch");
+    exactDescription(rawLink, *rawBoundary.description, "Combined raw boundary description mismatch");
     launch(root / L"raw-boundary.lnk", root / L"raw-boundary.bin", {std::wstring(1023, L'a')});
     Options quotedBoundary;
     quotedBoundary.arguments = std::vector<std::string>{std::string(1021, 'q')};
+    quotedBoundary.description = std::string(259, 'd');
     success(alias_plugin::createAlias(path(recorder), path(root / L"quoted-boundary"), quotedBoundary));
+    Link quotedLink(root / L"quoted-boundary.lnk");
+    exactArguments(quotedLink, alias_plugin::quoteArguments(*quotedBoundary.arguments),
+                   "Combined quoted boundary arguments mismatch");
+    exactDescription(quotedLink, *quotedBoundary.description, "Combined quoted boundary description mismatch");
     launch(root / L"quoted-boundary.lnk", root / L"quoted-boundary.bin", {std::wstring(1021, L'q')});
 }
 
@@ -453,7 +469,11 @@ void failures(const fs::path& root, const fs::path& recorder) {
         reject(path(recorder), options, "INVALID_OPTION");
     }
     options = {};
-    options.description = std::string(1024, 'x');
+    for (const int length : {260, 261, 1023, 1024}) {
+        options.description = std::string(length, 'x');
+        reject(path(recorder), options, "INVALID_OPTION");
+    }
+    options.description = utf8(std::wstring(260, L'\u65e5'));
     reject(path(recorder), options, "INVALID_OPTION");
     options = {};
     options.argumentsText = std::string(32767, 'x');
@@ -529,9 +549,11 @@ void failures(const fs::path& root, const fs::path& recorder) {
     failure(alias_plugin::createAlias(path(recorder), path(existing), excessive), "INVALID_OPTION");
     require(bytes(existing) == originalLink, "Overlong serialized arguments changed the existing shortcut");
     excessive.arguments.reset();
-    excessive.description = std::string(1024, 'x');
-    failure(alias_plugin::createAlias(path(recorder), path(existing), excessive), "INVALID_OPTION");
-    require(bytes(existing) == originalLink, "Overlong description changed the existing shortcut");
+    for (const int length : {260, 261, 1023, 1024}) {
+        excessive.description = std::string(length, 'x');
+        failure(alias_plugin::createAlias(path(recorder), path(existing), excessive), "INVALID_OPTION");
+        require(bytes(existing) == originalLink, "Overlong description changed the existing shortcut");
+    }
     options.description = "replacement";
     require(SetFileAttributesW(existing.c_str(), FILE_ATTRIBUTE_READONLY) != FALSE,
             "Cannot make shortcut read-only");

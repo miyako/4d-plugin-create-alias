@@ -93,13 +93,17 @@ Arguments are **never path-converted**, expanded, or interpreted as shell
 syntax. `argumentsText` bypasses serialization; the caller owns its quoting.
 The target controls argv parsing and execution behavior.
 
-Windows Shell Link fields have conservative supported bounds: paths to 259
-UTF-16 code units, description to 1,023, and the serialized/raw argument string
+Windows Shell Link fields have conservative supported bounds: paths and
+description to 259 UTF-16 code units, and the serialized/raw argument string
 to 1,023 (including quoting). These are not claims about the OS's absolute
 maximum. Over-limit values are errors, never silently truncated. The backend
 reloads the staged shortcut into a fresh COM object and verifies arguments,
 description, target, working directory, icon path/index, and show state before
 publication; an in-memory setter alone is not acceptance.
+The description bound also protects argument interpretation: in Windows
+acceptance tests, a longer description remained intact in the binary file but
+the platform's reloaded getters truncated it and misread the adjacent arguments.
+Valid serialized bytes alone are therefore not sufficient acceptance.
 
 ### Paths
 
