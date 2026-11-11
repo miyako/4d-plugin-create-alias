@@ -1,0 +1,11 @@
+{
+  "name": "Create Alias",
+  "id": 31072,
+  "commands": [
+    {
+      "theme": "Create Alias",
+      "syntax": "CREATE_ALIAS_EX(&T;&T;&J):J",
+      "threadSafe": false
+    }
+  ]
+}

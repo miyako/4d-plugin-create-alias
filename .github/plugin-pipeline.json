@@ -1,0 +1,17 @@
+{
+  "build_dir": "create-alias/build",
+  "bundle_identifier": "com.miyako.create-alias",
+  "dependencies": [],
+  "macos_deployment_target": "11.0",
+  "native_tests": true,
+  "product": "create-alias",
+  "profile": "macos-universal-windows-x64",
+  "release_branch": "main",
+  "schema": 1,
+  "sdk_dir": "4D-Plugin-SDK",
+  "signing_environment": "release-signing",
+  "signing_policy": "developer-id",
+  "source_dir": "create-alias",
+  "startup_method": "test_all",
+  "test_project": "create-alias/create-alias-test/Project/create-alias.4DProject"
+}

@@ -16,6 +16,12 @@ import prepare_example_update as update
 
 class ExampleUpdateTests(unittest.TestCase):
     def test_real_example_preserves_methods_manifest_and_header(self):
+        baseline = subprocess.run(
+            ["git", "-C", str(ROOT), "cat-file", "-e", f"{update.BASELINE}^{{commit}}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if baseline.returncode:
+            self.skipTest("Tutorial-only example history is not part of this generated product")
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory).resolve() / "example-update"
             update.prepare(update.BASELINE, output)
@@ -37,8 +43,9 @@ class ExampleUpdateTests(unittest.TestCase):
 
     def test_existing_output_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ValueError, "existing output"):
-                update.prepare(update.BASELINE, Path(directory).resolve())
+            with patch.object(update, "git", return_value=b"commit"):
+                with self.assertRaisesRegex(ValueError, "existing output"):
+                    update.prepare(update.BASELINE, Path(directory).resolve())
 
     def test_nonimmutable_ref_is_rejected_before_git(self):
         with patch.object(update, "git") as git:

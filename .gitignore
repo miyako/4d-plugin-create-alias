@@ -10,3 +10,25 @@ example/cmake-build/
 example/.vs/*
 example/example/x64/*
 **/__pycache__/
+create-alias/build/
+create-alias/create-alias-test/Plugins/
+create-alias/create-alias-test/Data/
+create-alias/create-alias-test/Logs/
+create-alias/create-alias-test/Project/DerivedData/
+create-alias/create-alias-test/userPreferences.*
+.local-tools/
+# BEGIN 4D PLUGIN PIPELINE (managed)
+/create-alias/build/
+/create-alias/create-alias-test/Plugins/
+/.local-tools/
+/.package-inputs/
+/.package-validation/
+/.release-package/
+/.signed-distribution/
+/.signed-extracted/
+/.publish-extracted/
+/.draft-upload-check/
+/.draft-extracted/
+/.release-notes
+__pycache__/
+# END 4D PLUGIN PIPELINE (managed)
